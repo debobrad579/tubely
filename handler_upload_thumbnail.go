@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/debobrad579/tubely/internal/auth"
 	"github.com/google/uuid"
 )
 
@@ -45,6 +45,7 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		respondWithError(w, http.StatusBadRequest, "Failed to form file", err)
 		return
 	}
+	defer file.Close()
 
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
@@ -73,6 +74,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 	filePath := filepath.Join(cfg.assetsRoot, fmt.Sprintf("%s.%s", filename, fileExtention))
 	newFile, err := os.Create(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create file", err)
+		return
+	}
+	defer newFile.Close()
 	io.Copy(newFile, file)
 
 	thumbnailURL := fmt.Sprintf("http://localhost:8091/assets/%s.%s", filename, fileExtention)
