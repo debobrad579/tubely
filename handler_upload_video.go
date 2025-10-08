@@ -1,19 +1,64 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/debobrad579/tubely/internal/auth"
 	"github.com/google/uuid"
 )
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath,
+	)
+
+	var b []byte
+	buf := bytes.NewBuffer(b)
+	cmd.Stdout = buf
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	type resultType struct {
+		Streams []struct {
+			Width  float64 `json:"width"`
+			Height float64 `json:"height"`
+		} `json:"streams"`
+	}
+
+	var result resultType
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		return "", err
+	}
+
+	ratio := result.Streams[0].Width / result.Streams[0].Height
+
+	const landscape = 16.0 / 9.0
+	const portrait = 9.0 / 16.0
+
+	if ratio > landscape-0.05 && ratio < landscape+0.05 {
+		return "landscape", nil
+	} else if ratio > portrait-0.05 && ratio < portrait+0.05 {
+		return "portrait", nil
+	}
+
+	return "other", nil
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(http.MaxBytesReader(w, r.Body, 1<<30))
@@ -75,11 +120,16 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	io.Copy(tempFile, file)
 	tempFile.Seek(0, io.SeekStart)
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get video aspect ratio", err)
+	}
+
 	fileExtention := strings.TrimPrefix(mediaType, "video/")
 	b := make([]byte, 32)
 	rand.Read(b)
 	filename := base64.RawURLEncoding.EncodeToString(b)
-	fileKey := fmt.Sprintf("%s.%s", filename, fileExtention)
+	fileKey := fmt.Sprintf("%s/%s.%s", aspectRatio, filename, fileExtention)
 
 	cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{Bucket: &cfg.s3Bucket, Key: &fileKey, Body: tempFile, ContentType: &mediaType})
 
