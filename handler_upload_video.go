@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -26,9 +27,8 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		filePath,
 	)
 
-	var b []byte
-	buf := bytes.NewBuffer(b)
-	cmd.Stdout = buf
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
 
 	if err := cmd.Run(); err != nil {
 		return "", err
@@ -46,6 +46,10 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		return "", err
 	}
 
+	if len(result.Streams) == 0 {
+		return "", errors.New("No streams found in file")
+	}
+
 	ratio := result.Streams[0].Width / result.Streams[0].Height
 
 	const landscape = 16.0 / 9.0
@@ -58,6 +62,23 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 
 	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+
+	cmd := exec.Command("ffmpeg",
+		"-i", filePath, "-c",
+		"copy", "-movflags",
+		"faststart", "-f",
+		"mp4", outputFilePath,
+	)
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	return outputFilePath, nil
 }
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
@@ -117,13 +138,31 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
-	io.Copy(tempFile, file)
+	if _, err := io.Copy(tempFile, file); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to copy file", err)
+		return
+	}
 	tempFile.Seek(0, io.SeekStart)
 
 	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to get video aspect ratio", err)
+		return
 	}
+
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to process video", err)
+		return
+	}
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to read file", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+	defer processedFile.Close()
 
 	fileExtention := strings.TrimPrefix(mediaType, "video/")
 	b := make([]byte, 32)
@@ -131,7 +170,10 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	filename := base64.RawURLEncoding.EncodeToString(b)
 	fileKey := fmt.Sprintf("%s/%s.%s", aspectRatio, filename, fileExtention)
 
-	cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{Bucket: &cfg.s3Bucket, Key: &fileKey, Body: tempFile, ContentType: &mediaType})
+	if _, err := cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{Bucket: &cfg.s3Bucket, Key: &fileKey, Body: processedFile, ContentType: &mediaType}); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to upload video", err)
+		return
+	}
 
 	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileKey)
 	video.VideoURL = &videoURL
